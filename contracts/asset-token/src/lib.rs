@@ -15,6 +15,7 @@
 /// Issue #153 — Automated Asset Token Redemption and Liquidation Pool.
 pub mod redemption_pool;
 pub mod stock_split;
+pub mod redemption_pool;
 
 pub use redemption_pool::{AssetStatus, RedemptionError};
 
@@ -61,9 +62,20 @@ pub enum Error {
     Locked = 10,
     /// Issue #90: split ratio is zero, or the cumulative multiplier overflows.
     InvalidSplitRatio = 11,
+NotLiquidated = 12,
+    AlreadyLiquidated = 13,
+    StablecoinNotConfigured = 14,
+    RedemptionExceedsAllocation = 15,
     /// Issue #153: the asset has been liquidated; secondary-market transfers
     /// are permanently disabled.
-    AssetLiquidated = 12,
+    AssetLiquidated = 16,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetStatus {
+    Active,
+    Liquidated,
 }
 
 #[derive(Clone)]
@@ -91,6 +103,11 @@ enum DataKey {
     SplitMultiplier,
     /// Issue #90: number of splits already applied to this holder's stored balance.
     HolderEpoch(Address),
+    AssetStatus,
+    Stablecoin,
+    LiquidationSupply,
+    LiquidationProceeds,
+    Redeemed(Address),
 }
 
 #[contract]
@@ -142,6 +159,9 @@ impl AssetTokenContract {
             .instance()
             .set(&DataKey::Valuation, &valuation);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetStatus, &AssetStatus::Active);
 
         stock_split::set_balance(&env, &admin.clone(), total_supply);
 
@@ -153,6 +173,7 @@ impl AssetTokenContract {
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         Self::require_not_paused(&env);
+Self::require_active(&env);
         // Issue #153: once the asset is liquidated the secondary market is
         // closed forever — see `redemption_pool::ensure_transferable`.
         redemption_pool::ensure_transferable(&env);
@@ -204,6 +225,7 @@ impl AssetTokenContract {
     pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
         Self::require_admin(&env, &admin);
         Self::require_not_paused(&env);
+        Self::require_active(&env);
         if amount <= 0 {
             panic_with_error!(env, Error::InvalidAmount);
         }
@@ -273,6 +295,78 @@ impl AssetTokenContract {
     ) {
         Self::require_admin(&env, &admin);
         stock_split::execute(&env, ratio_numerator, ratio_denominator);
+    }
+
+    /// Configure the stablecoin used for liquidation proceeds.
+    pub fn set_liquidation_stablecoin(env: Env, admin: Address, stablecoin: Address) {
+        Self::require_admin(&env, &admin);
+        Self::require_active(&env);
+        env.storage().instance().set(&DataKey::Stablecoin, &stablecoin);
+    }
+
+    /// Deposit the cash proceeds from an asset sale and permanently close the
+    /// secondary market. The stablecoin must already have been transferred to
+    /// this contract by the administrator.
+    pub fn deposit_liquidation_proceeds(env: Env, admin: Address, stablecoin_amount: i128) {
+        Self::require_admin(&env, &admin);
+        Self::require_active(&env);
+        if stablecoin_amount <= 0 {
+            panic_with_error!(env, Error::InvalidAmount);
+        }
+        if !env.storage().instance().has(&DataKey::Stablecoin) {
+            panic_with_error!(env, Error::StablecoinNotConfigured);
+        }
+        let supply = Self::total_supply(env.clone());
+        if supply <= 0 {
+            panic_with_error!(env, Error::InvalidAmount);
+        }
+        env.storage().instance().set(&DataKey::LiquidationSupply, &supply);
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquidationProceeds, &stablecoin_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetStatus, &AssetStatus::Liquidated);
+        env.events()
+            .publish((symbol_short!("liquidate"),), stablecoin_amount);
+    }
+
+    /// Burn asset tokens and pay the holder's pro-rata share of the deposited
+    /// proceeds. Transfers and minting are disabled after liquidation.
+    pub fn redeem_liquidation_proceeds(env: Env, holder: Address, token_amount: i128) -> i128 {
+        holder.require_auth();
+        if Self::status(env.clone()) != AssetStatus::Liquidated {
+            panic_with_error!(env, Error::NotLiquidated);
+        }
+        if token_amount <= 0 {
+            panic_with_error!(env, Error::InvalidAmount);
+        }
+        let balance = Self::balance(env.clone(), holder.clone());
+        let redeemed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Redeemed(holder.clone()))
+            .unwrap_or(0);
+        if balance < token_amount {
+            panic_with_error!(env, Error::InsufficientBalance);
+        }
+        let supply: i128 = env.storage().instance().get(&DataKey::LiquidationSupply).unwrap();
+        let proceeds: i128 = env.storage().instance().get(&DataKey::LiquidationProceeds).unwrap();
+        let payout = ((token_amount as u128 * proceeds as u128) / supply as u128) as i128;
+        let new_redeemed = redeemed.checked_add(token_amount).unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
+        stock_split::set_balance(&env, &holder.clone(), balance - token_amount);
+        env.storage().persistent().set(&DataKey::Redeemed(holder.clone()), &new_redeemed);
+        let total = Self::total_supply(env.clone());
+        env.storage().instance().set(&DataKey::TotalSupply, &(total - token_amount));
+        let stablecoin: Address = env.storage().instance().get(&DataKey::Stablecoin).unwrap();
+        let args: Vec<Val> = (env.current_contract_address(), holder.clone(), payout).into_val(&env);
+        env.invoke_contract::<()>(&stablecoin, &Symbol::new(&env, "transfer"), args);
+        env.events().publish((symbol_short!("redeem"), holder), (token_amount, payout));
+        payout
+    }
+
+    pub fn status(env: Env) -> AssetStatus {
+        env.storage().instance().get(&DataKey::AssetStatus).unwrap_or(AssetStatus::Active)
     }
 
     /// Issue #90 - cumulative split multiplier as `(numerator, denominator)`.
@@ -474,7 +568,7 @@ impl AssetTokenContract {
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+            .unwrap_or_else(|| panic_with_error!(env, Error::Unauthorized));
         admin.require_auth();
         if admin != &stored_admin {
             panic_with_error!(env, Error::Unauthorized);
@@ -489,6 +583,12 @@ impl AssetTokenContract {
             .unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::Paused);
+        }
+    }
+
+    fn require_active(env: &Env) {
+        if Self::status(env.clone()) == AssetStatus::Liquidated {
+            panic_with_error!(env, Error::AlreadyLiquidated);
         }
     }
 
